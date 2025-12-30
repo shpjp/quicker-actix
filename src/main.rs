@@ -1,126 +1,203 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
-use chrono::{DateTime, Utc};
+mod auth;
+mod db;
+mod models;
+
+use actix_cors::Cors;
+use actix_files as fs;
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use dotenv::dotenv;
+use models::*;
+use sqlx::PgPool;
+use std::env;
 use uuid::Uuid;
+use validator::Validate;
 
-// ============ DATA MODELS ============
+// ============ APP STATE ============
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct User {
-    id: String,
-    username: String,
-    email: String,
-    display_name: String,
-    bio: Option<String>,
-    followers_count: u32,
-    following_count: u32,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Tweet {
-    id: String,
-    user_id: String,
-    content: String,
-    likes_count: u32,
-    retweets_count: u32,
-    replies_count: u32,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Like {
-    id: String,
-    user_id: String,
-    tweet_id: String,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Follow {
-    id: String,
-    follower_id: String,
-    following_id: String,
-    created_at: DateTime<Utc>,
-}
-
-// ============ REQUEST/RESPONSE TYPES ============
-
-#[derive(Debug, Deserialize)]
-struct CreateUserRequest {
-    username: String,
-    email: String,
-    display_name: String,
-    bio: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateTweetRequest {
-    user_id: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LikeTweetRequest {
-    user_id: String,
-    tweet_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct FollowUserRequest {
-    follower_id: String,
-    following_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ApiResponse<T> {
-    success: bool,
-    data: Option<T>,
-    message: Option<String>,
-}
-
-// ============ IN-MEMORY STORAGE ============
-
+#[derive(Clone)]
 struct AppState {
-    users: Mutex<Vec<User>>,
-    tweets: Mutex<Vec<Tweet>>,
-    likes: Mutex<Vec<Like>>,
-    follows: Mutex<Vec<Follow>>,
+    db: PgPool,
+    jwt_secret: String,
 }
 
-// ============ API HANDLERS ============
+// ============ HEALTH CHECK ============
 
-// Health check endpoint
 async fn health_check() -> impl Responder {
     HttpResponse::Ok().json(ApiResponse {
         success: true,
-        data: Some("Twitter API is running"),
+        data: Some("Twitter API is running with PostgreSQL"),
         message: None,
     })
 }
 
-// Get all users
-async fn get_users(data: web::Data<AppState>) -> impl Responder {
-    let users = data.users.lock().unwrap();
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        data: Some(users.clone()),
-        message: None,
-    })
+// ============ AUTH HANDLERS ============
+
+async fn register(state: web::Data<AppState>, req: web::Json<RegisterRequest>) -> impl Responder {
+    // Validate input
+    if let Err(e) = req.validate() {
+        return HttpResponse::BadRequest().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Validation error: {}", e)),
+        });
+    }
+
+    // Check if user exists
+    let existing = sqlx::query_as::<_, User>(
+        "SELECT * FROM users WHERE email = $1 OR username = $2"
+    )
+    .bind(&req.email)
+    .bind(&req.username)
+    .fetch_optional(&state.db)
+    .await;
+
+    if let Ok(Some(_)) = existing {
+        return HttpResponse::BadRequest().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some("User with this email or username already exists".to_string()),
+        });
+    }
+
+    // Hash password
+    let password_hash = match auth::hash_password(&req.password) {
+        Ok(hash) => hash,
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some("Failed to hash password".to_string()),
+            });
+        }
+    };
+
+    // Insert user
+    let user = sqlx::query_as::<_, User>(
+        "INSERT INTO users (username, email, password_hash, display_name) 
+         VALUES ($1, $2, $3, $4) 
+         RETURNING *"
+    )
+    .bind(&req.username)
+    .bind(&req.email)
+    .bind(&password_hash)
+    .bind(&req.display_name)
+    .fetch_one(&state.db)
+    .await;
+
+    match user {
+        Ok(user) => {
+            // Create JWT token
+            let token = match auth::create_jwt(user.id, user.email.clone(), &state.jwt_secret) {
+                Ok(t) => t,
+                Err(_) => {
+                    return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                        success: false,
+                        data: None,
+                        message: Some("Failed to create token".to_string()),
+                    });
+                }
+            };
+
+            HttpResponse::Created().json(ApiResponse {
+                success: true,
+                data: Some(AuthResponse {
+                    token,
+                    user: user.into(),
+                }),
+                message: Some("User registered successfully".to_string()),
+            })
+        }
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Database error: {}", e)),
+        }),
+    }
 }
 
-// Get user by ID
-async fn get_user(data: web::Data<AppState>, user_id: web::Path<String>) -> impl Responder {
-    let users = data.users.lock().unwrap();
-    let user_id = user_id.into_inner();
-    match users.iter().find(|u| u.id == user_id) {
-        Some(user) => HttpResponse::Ok().json(ApiResponse {
+async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> impl Responder {
+    // Validate input
+    if let Err(e) = req.validate() {
+        return HttpResponse::BadRequest().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Validation error: {}", e)),
+        });
+    }
+
+    // Find user by email
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
+        .bind(&req.email)
+        .fetch_optional(&state.db)
+        .await;
+
+    match user {
+        Ok(Some(user)) => {
+            // Verify password
+            match auth::verify_password(&req.password, &user.password_hash) {
+                Ok(true) => {
+                    // Create JWT token
+                    let token = match auth::create_jwt(user.id, user.email.clone(), &state.jwt_secret) {
+                        Ok(t) => t,
+                        Err(_) => {
+                            return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                                success: false,
+                                data: None,
+                                message: Some("Failed to create token".to_string()),
+                            });
+                        }
+                    };
+
+                    HttpResponse::Ok().json(ApiResponse {
+                        success: true,
+                        data: Some(AuthResponse {
+                            token,
+                            user: user.into(),
+                        }),
+                        message: Some("Login successful".to_string()),
+                    })
+                }
+                _ => HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                    success: false,
+                    data: None,
+                    message: Some("Invalid credentials".to_string()),
+                }),
+            }
+        }
+        _ => HttpResponse::Unauthorized().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some("Invalid credentials".to_string()),
+        }),
+    }
+}
+
+async fn get_me(state: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
+    
+    let user_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
+    };
+
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await;
+
+    match user {
+        Ok(Some(user)) => HttpResponse::Ok().json(ApiResponse {
             success: true,
-            data: Some(user.clone()),
+            data: Some(UserResponse::from(user)),
             message: None,
         }),
-        None => HttpResponse::NotFound().json(ApiResponse::<()> {
+        _ => HttpResponse::NotFound().json(ApiResponse::<()> {
             success: false,
             data: None,
             message: Some("User not found".to_string()),
@@ -128,184 +205,378 @@ async fn get_user(data: web::Data<AppState>, user_id: web::Path<String>) -> impl
     }
 }
 
-// Create a new user
-async fn create_user(
-    data: web::Data<AppState>,
-    req: web::Json<CreateUserRequest>,
-) -> impl Responder {
-    let mut users = data.users.lock().unwrap();
-    
-    // Check if username or email already exists
-    if users.iter().any(|u| u.username == req.username || u.email == req.email) {
-        return HttpResponse::BadRequest().json(ApiResponse::<()> {
-            success: false,
-            data: None,
-            message: Some("Username or email already exists".to_string()),
-        });
-    }
+// ============ USER HANDLERS ============
 
-    let user = User {
-        id: Uuid::new_v4().to_string(),
-        username: req.username.clone(),
-        email: req.email.clone(),
-        display_name: req.display_name.clone(),
-        bio: req.bio.clone(),
-        followers_count: 0,
-        following_count: 0,
-        created_at: Utc::now(),
-    };
+async fn get_user_by_username(state: web::Data<AppState>, username: web::Path<String>) -> impl Responder {
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = $1")
+        .bind(username.as_str())
+        .fetch_optional(&state.db)
+        .await;
 
-    users.push(user.clone());
-    HttpResponse::Created().json(ApiResponse {
-        success: true,
-        data: Some(user),
-        message: Some("User created successfully".to_string()),
-    })
-}
-
-// Get all tweets
-async fn get_tweets(data: web::Data<AppState>) -> impl Responder {
-    let tweets = data.tweets.lock().unwrap();
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        data: Some(tweets.clone()),
-        message: None,
-    })
-}
-
-// Get tweet by ID
-async fn get_tweet(data: web::Data<AppState>, tweet_id: web::Path<String>) -> impl Responder {
-    let tweets = data.tweets.lock().unwrap();
-    let tweet_id = tweet_id.into_inner();
-    match tweets.iter().find(|t| t.id == tweet_id) {
-        Some(tweet) => HttpResponse::Ok().json(ApiResponse {
+    match user {
+        Ok(Some(user)) => HttpResponse::Ok().json(ApiResponse {
             success: true,
-            data: Some(tweet.clone()),
+            data: Some(UserResponse::from(user)),
             message: None,
         }),
-        None => HttpResponse::NotFound().json(ApiResponse::<()> {
+        Ok(None) => HttpResponse::NotFound().json(ApiResponse::<()> {
             success: false,
             data: None,
-            message: Some("Tweet not found".to_string()),
+            message: Some("User not found".to_string()),
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Database error: {}", e)),
         }),
     }
 }
 
-// Get tweets by user ID
-async fn get_user_tweets(data: web::Data<AppState>, user_id: web::Path<String>) -> impl Responder {
-    let tweets = data.tweets.lock().unwrap();
-    let user_id = user_id.into_inner();
-    let user_tweets: Vec<Tweet> = tweets
-        .iter()
-        .filter(|t| t.user_id == user_id)
-        .cloned()
-        .collect();
+async fn update_profile(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    update: web::Json<UpdateProfileRequest>,
+) -> impl Responder {
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
     
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        data: Some(user_tweets),
-        message: None,
-    })
+    let user_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
+    };
+
+    let result = sqlx::query_as::<_, User>(
+        "UPDATE users 
+         SET display_name = COALESCE($1, display_name),
+             bio = COALESCE($2, bio),
+             profile_image = COALESCE($3, profile_image),
+             banner_image = COALESCE($4, banner_image)
+         WHERE id = $5
+         RETURNING *"
+    )
+    .bind(&update.display_name)
+    .bind(&update.bio)
+    .bind(&update.profile_image)
+    .bind(&update.banner_image)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await;
+
+    match result {
+        Ok(user) => HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            data: Some(UserResponse::from(user)),
+            message: Some("Profile updated successfully".to_string()),
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Database error: {}", e)),
+        }),
+    }
 }
 
-// Create a new tweet
+// ============ TWEET HANDLERS ============
+
 async fn create_tweet(
-    data: web::Data<AppState>,
-    req: web::Json<CreateTweetRequest>,
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    tweet_req: web::Json<CreateTweetRequest>,
 ) -> impl Responder {
-    let users = data.users.lock().unwrap();
+    if let Err(e) = tweet_req.validate() {
+        return HttpResponse::BadRequest().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Validation error: {}", e)),
+        });
+    }
+
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
     
-    // Verify user exists
-    if !users.iter().any(|u| u.id == req.user_id) {
-        return HttpResponse::BadRequest().json(ApiResponse::<()> {
-            success: false,
-            data: None,
-            message: Some("User not found".to_string()),
-        });
-    }
-
-    // Validate tweet content
-    if req.content.is_empty() || req.content.len() > 280 {
-        return HttpResponse::BadRequest().json(ApiResponse::<()> {
-            success: false,
-            data: None,
-            message: Some("Tweet content must be between 1 and 280 characters".to_string()),
-        });
-    }
-
-    drop(users);
-
-    let mut tweets = data.tweets.lock().unwrap();
-    let tweet = Tweet {
-        id: Uuid::new_v4().to_string(),
-        user_id: req.user_id.clone(),
-        content: req.content.clone(),
-        likes_count: 0,
-        retweets_count: 0,
-        replies_count: 0,
-        created_at: Utc::now(),
+    let user_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
     };
 
-    tweets.push(tweet.clone());
-    HttpResponse::Created().json(ApiResponse {
-        success: true,
-        data: Some(tweet),
-        message: Some("Tweet created successfully".to_string()),
-    })
+    let tweet = sqlx::query_as::<_, Tweet>(
+        "INSERT INTO tweets (user_id, content, image_url) VALUES ($1, $2, $3) RETURNING *"
+    )
+    .bind(user_id)
+    .bind(&tweet_req.content)
+    .bind(&tweet_req.image_url)
+    .fetch_one(&state.db)
+    .await;
+
+    match tweet {
+        Ok(tweet) => {
+            // Get user info
+            let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(&state.db)
+                .await;
+
+            if let Ok(user) = user {
+                HttpResponse::Created().json(ApiResponse {
+                    success: true,
+                    data: Some(TweetResponse {
+                        id: tweet.id,
+                        content: tweet.content,
+                        image_url: tweet.image_url,
+                        likes_count: tweet.likes_count,
+                        retweets_count: tweet.retweets_count,
+                        replies_count: tweet.replies_count,
+                        created_at: tweet.created_at,
+                        user: user.into(),
+                        is_liked: false,
+                    }),
+                    message: Some("Tweet created successfully".to_string()),
+                })
+            } else {
+                HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                    success: false,
+                    data: None,
+                    message: Some("Failed to fetch user data".to_string()),
+                })
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Database error: {}", e)),
+        }),
+    }
 }
 
-// Delete a tweet
-async fn delete_tweet(
-    data: web::Data<AppState>,
-    tweet_id: web::Path<String>,
-) -> impl Responder {
-    let mut tweets = data.tweets.lock().unwrap();
-    let tweet_id = tweet_id.into_inner();
+async fn get_timeline(state: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
     
-    if let Some(pos) = tweets.iter().position(|t| t.id == tweet_id) {
-        tweets.remove(pos);
-        HttpResponse::Ok().json(ApiResponse {
+    let user_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
+    };
+
+    // Get tweets from followed users + own tweets
+    let tweets = sqlx::query_as::<_, TweetWithUser>(
+        "SELECT t.id, t.user_id, t.content, t.image_url, t.likes_count, t.retweets_count, 
+                t.replies_count, t.created_at,
+                u.username as user_username, u.display_name as user_display_name, 
+                u.email as user_email, u.bio as user_bio, 
+                u.profile_image as user_profile_image, u.banner_image as user_banner_image,
+                u.followers_count as user_followers_count, u.following_count as user_following_count,
+                u.verified as user_verified, u.created_at as user_created_at
+         FROM tweets t
+         INNER JOIN users u ON t.user_id = u.id
+         WHERE t.user_id IN (
+             SELECT following_id FROM follows WHERE follower_id = $1
+             UNION
+             SELECT $1
+         )
+         ORDER BY t.created_at DESC
+         LIMIT 50"
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await;
+
+    match tweets {
+        Ok(tweets) => {
+            let mut tweet_responses = Vec::new();
+            
+            for tweet in tweets {
+                // Check if current user liked this tweet
+                let is_liked = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM likes WHERE user_id = $1 AND tweet_id = $2)"
+                )
+                .bind(user_id)
+                .bind(tweet.id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or(false);
+
+                tweet_responses.push(TweetResponse {
+                    id: tweet.id,
+                    content: tweet.content,
+                    image_url: tweet.image_url,
+                    likes_count: tweet.likes_count,
+                    retweets_count: tweet.retweets_count,
+                    replies_count: tweet.replies_count,
+                    created_at: tweet.created_at,
+                    user: UserResponse {
+                        id: tweet.user_id,
+                        username: tweet.user_username,
+                        email: tweet.user_email,
+                        display_name: tweet.user_display_name,
+                        bio: tweet.user_bio,
+                        profile_image: tweet.user_profile_image,
+                        banner_image: tweet.user_banner_image,
+                        followers_count: tweet.user_followers_count,
+                        following_count: tweet.user_following_count,
+                        verified: tweet.user_verified,
+                        created_at: tweet.user_created_at,
+                    },
+                    is_liked,
+                });
+            }
+
+            HttpResponse::Ok().json(ApiResponse {
+                success: true,
+                data: Some(tweet_responses),
+                message: None,
+            })
+        }
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Database error: {}", e)),
+        }),
+    }
+}
+
+async fn get_user_tweets(state: web::Data<AppState>, username: web::Path<String>) -> impl Responder {
+    let tweets = sqlx::query_as::<_, TweetWithUser>(
+        "SELECT t.id, t.user_id, t.content, t.image_url, t.likes_count, t.retweets_count, 
+                t.replies_count, t.created_at,
+                u.username as user_username, u.display_name as user_display_name, 
+                u.email as user_email, u.bio as user_bio, 
+                u.profile_image as user_profile_image, u.banner_image as user_banner_image,
+                u.followers_count as user_followers_count, u.following_count as user_following_count,
+                u.verified as user_verified, u.created_at as user_created_at
+         FROM tweets t
+         INNER JOIN users u ON t.user_id = u.id
+         WHERE u.username = $1
+         ORDER BY t.created_at DESC"
+    )
+    .bind(username.as_str())
+    .fetch_all(&state.db)
+    .await;
+
+    match tweets {
+        Ok(tweets) => {
+            let tweet_responses: Vec<TweetResponse> = tweets
+                .into_iter()
+                .map(|tweet| TweetResponse {
+                    id: tweet.id,
+                    content: tweet.content,
+                    image_url: tweet.image_url,
+                    likes_count: tweet.likes_count,
+                    retweets_count: tweet.retweets_count,
+                    replies_count: tweet.replies_count,
+                    created_at: tweet.created_at,
+                    user: UserResponse {
+                        id: tweet.user_id,
+                        username: tweet.user_username,
+                        email: tweet.user_email,
+                        display_name: tweet.user_display_name,
+                        bio: tweet.user_bio,
+                        profile_image: tweet.user_profile_image,
+                        banner_image: tweet.user_banner_image,
+                        followers_count: tweet.user_followers_count,
+                        following_count: tweet.user_following_count,
+                        verified: tweet.user_verified,
+                        created_at: tweet.user_created_at,
+                    },
+                    is_liked: false,
+                })
+                .collect();
+
+            HttpResponse::Ok().json(ApiResponse {
+                success: true,
+                data: Some(tweet_responses),
+                message: None,
+            })
+        }
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Database error: {}", e)),
+        }),
+    }
+}
+
+async fn delete_tweet(state: web::Data<AppState>, req: HttpRequest, tweet_id: web::Path<Uuid>) -> impl Responder {
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
+    
+    let user_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
+    };
+
+    let result = sqlx::query("DELETE FROM tweets WHERE id = $1 AND user_id = $2")
+        .bind(tweet_id.into_inner())
+        .bind(user_id)
+        .execute(&state.db)
+        .await;
+
+    match result {
+        Ok(result) if result.rows_affected() > 0 => HttpResponse::Ok().json(ApiResponse {
             success: true,
             data: Some("Tweet deleted successfully"),
             message: None,
-        })
-    } else {
-        HttpResponse::NotFound().json(ApiResponse::<()> {
+        }),
+        Ok(_) => HttpResponse::NotFound().json(ApiResponse::<()> {
             success: false,
             data: None,
-            message: Some("Tweet not found".to_string()),
-        })
+            message: Some("Tweet not found or unauthorized".to_string()),
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            message: Some(format!("Database error: {}", e)),
+        }),
     }
 }
 
-// Like a tweet
-async fn like_tweet(
-    data: web::Data<AppState>,
-    req: web::Json<LikeTweetRequest>,
-) -> impl Responder {
-    let users = data.users.lock().unwrap();
-    let mut tweets = data.tweets.lock().unwrap();
-    let mut likes = data.likes.lock().unwrap();
+// ============ LIKE HANDLERS ============
 
-    // Verify user and tweet exist
-    if !users.iter().any(|u| u.id == req.user_id) {
-        return HttpResponse::BadRequest().json(ApiResponse::<()> {
-            success: false,
-            data: None,
-            message: Some("User not found".to_string()),
-        });
-    }
+async fn like_tweet(state: web::Data<AppState>, req: HttpRequest, tweet_id: web::Path<Uuid>) -> impl Responder {
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
+    
+    let user_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
+    };
 
-    if !tweets.iter().any(|t| t.id == req.tweet_id) {
-        return HttpResponse::BadRequest().json(ApiResponse::<()> {
-            success: false,
-            data: None,
-            message: Some("Tweet not found".to_string()),
-        });
-    }
+    let tweet_id = tweet_id.into_inner();
 
     // Check if already liked
-    if likes.iter().any(|l| l.user_id == req.user_id && l.tweet_id == req.tweet_id) {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM likes WHERE user_id = $1 AND tweet_id = $2)"
+    )
+    .bind(user_id)
+    .bind(tweet_id)
+    .fetch_one(&state.db)
+    .await;
+
+    if let Ok(true) = exists {
         return HttpResponse::BadRequest().json(ApiResponse::<()> {
             success: false,
             data: None,
@@ -313,94 +584,157 @@ async fn like_tweet(
         });
     }
 
-    // Create like
-    let like = Like {
-        id: Uuid::new_v4().to_string(),
-        user_id: req.user_id.clone(),
-        tweet_id: req.tweet_id.clone(),
-        created_at: Utc::now(),
+    // Insert like and update count
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(format!("Database error: {}", e)),
+            });
+        }
     };
 
-    // Increment like count
-    if let Some(tweet) = tweets.iter_mut().find(|t| t.id == req.tweet_id) {
-        tweet.likes_count += 1;
-    }
+    let like_result = sqlx::query("INSERT INTO likes (user_id, tweet_id) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(tweet_id)
+        .execute(&mut *tx)
+        .await;
 
-    likes.push(like.clone());
-    HttpResponse::Created().json(ApiResponse {
-        success: true,
-        data: Some(like),
-        message: Some("Tweet liked successfully".to_string()),
-    })
-}
-
-// Unlike a tweet
-async fn unlike_tweet(
-    data: web::Data<AppState>,
-    req: web::Json<LikeTweetRequest>,
-) -> impl Responder {
-    let mut tweets = data.tweets.lock().unwrap();
-    let mut likes = data.likes.lock().unwrap();
-
-    // Find and remove like
-    if let Some(pos) = likes.iter().position(|l| l.user_id == req.user_id && l.tweet_id == req.tweet_id) {
-        likes.remove(pos);
-
-        // Decrement like count
-        if let Some(tweet) = tweets.iter_mut().find(|t| t.id == req.tweet_id) {
-            tweet.likes_count = tweet.likes_count.saturating_sub(1);
-        }
-
-        HttpResponse::Ok().json(ApiResponse {
-            success: true,
-            data: Some("Tweet unliked successfully"),
-            message: None,
-        })
-    } else {
-        HttpResponse::NotFound().json(ApiResponse::<()> {
+    if like_result.is_err() {
+        let _ = tx.rollback().await;
+        return HttpResponse::InternalServerError().json(ApiResponse::<()> {
             success: false,
             data: None,
-            message: Some("Like not found".to_string()),
-        })
-    }
-}
-
-// Get likes for a tweet
-async fn get_tweet_likes(data: web::Data<AppState>, tweet_id: web::Path<String>) -> impl Responder {
-    let likes = data.likes.lock().unwrap();
-    let tweet_id = tweet_id.into_inner();
-    let tweet_likes: Vec<Like> = likes
-        .iter()
-        .filter(|l| l.tweet_id == tweet_id)
-        .cloned()
-        .collect();
-    
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        data: Some(tweet_likes),
-        message: None,
-    })
-}
-
-// Follow a user
-async fn follow_user(
-    data: web::Data<AppState>,
-    req: web::Json<FollowUserRequest>,
-) -> impl Responder {
-    let mut users = data.users.lock().unwrap();
-    let mut follows = data.follows.lock().unwrap();
-
-    // Check if both users exist
-    if !users.iter().any(|u| u.id == req.follower_id) || !users.iter().any(|u| u.id == req.following_id) {
-        return HttpResponse::BadRequest().json(ApiResponse::<()> {
-            success: false,
-            data: None,
-            message: Some("User not found".to_string()),
+            message: Some("Failed to like tweet".to_string()),
         });
     }
 
-    // Can't follow yourself
-    if req.follower_id == req.following_id {
+    let update_result = sqlx::query("UPDATE tweets SET likes_count = likes_count + 1 WHERE id = $1")
+        .bind(tweet_id)
+        .execute(&mut *tx)
+        .await;
+
+    match update_result {
+        Ok(_) => {
+            let _ = tx.commit().await;
+            HttpResponse::Ok().json(ApiResponse {
+                success: true,
+                data: Some("Tweet liked successfully"),
+                message: None,
+            })
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(format!("Database error: {}", e)),
+            })
+        }
+    }
+}
+
+async fn unlike_tweet(state: web::Data<AppState>, req: HttpRequest, tweet_id: web::Path<Uuid>) -> impl Responder {
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
+    
+    let user_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
+    };
+
+    let tweet_id = tweet_id.into_inner();
+
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(format!("Database error: {}", e)),
+            });
+        }
+    };
+
+    let delete_result = sqlx::query("DELETE FROM likes WHERE user_id = $1 AND tweet_id = $2")
+        .bind(user_id)
+        .bind(tweet_id)
+        .execute(&mut *tx)
+        .await;
+
+    match delete_result {
+        Ok(result) if result.rows_affected() > 0 => {
+            let _ = sqlx::query("UPDATE tweets SET likes_count = likes_count - 1 WHERE id = $1")
+                .bind(tweet_id)
+                .execute(&mut *tx)
+                .await;
+
+            let _ = tx.commit().await;
+            HttpResponse::Ok().json(ApiResponse {
+                success: true,
+                data: Some("Tweet unliked successfully"),
+                message: None,
+            })
+        }
+        _ => {
+            let _ = tx.rollback().await;
+            HttpResponse::NotFound().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some("Like not found".to_string()),
+            })
+        }
+    }
+}
+
+// ============ FOLLOW HANDLERS ============
+
+async fn follow_user(state: web::Data<AppState>, req: HttpRequest, username: web::Path<String>) -> impl Responder {
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
+    
+    let follower_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
+    };
+
+    // Get user to follow
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = $1")
+        .bind(username.as_str())
+        .fetch_optional(&state.db)
+        .await;
+
+    let following_id = match user {
+        Ok(Some(user)) => user.id,
+        Ok(None) => {
+            return HttpResponse::NotFound().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some("User not found".to_string()),
+            });
+        }
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(format!("Database error: {}", e)),
+            });
+        }
+    };
+
+    if follower_id == following_id {
         return HttpResponse::BadRequest().json(ApiResponse::<()> {
             success: false,
             data: None,
@@ -408,196 +742,214 @@ async fn follow_user(
         });
     }
 
-    // Check if already following
-    if follows.iter().any(|f| f.follower_id == req.follower_id && f.following_id == req.following_id) {
-        return HttpResponse::BadRequest().json(ApiResponse::<()> {
-            success: false,
-            data: None,
-            message: Some("Already following this user".to_string()),
-        });
-    }
-
-    // Create follow
-    let follow = Follow {
-        id: Uuid::new_v4().to_string(),
-        follower_id: req.follower_id.clone(),
-        following_id: req.following_id.clone(),
-        created_at: Utc::now(),
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(format!("Database error: {}", e)),
+            });
+        }
     };
 
-    // Update follower/following counts
-    if let Some(follower) = users.iter_mut().find(|u| u.id == req.follower_id) {
-        follower.following_count += 1;
-    }
-    if let Some(following) = users.iter_mut().find(|u| u.id == req.following_id) {
-        following.followers_count += 1;
-    }
+    let follow_result = sqlx::query("INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(follower_id)
+        .bind(following_id)
+        .execute(&mut *tx)
+        .await;
 
-    follows.push(follow.clone());
-    HttpResponse::Created().json(ApiResponse {
-        success: true,
-        data: Some(follow),
-        message: Some("User followed successfully".to_string()),
-    })
-}
+    if let Ok(result) = follow_result {
+        if result.rows_affected() > 0 {
+            let _ = sqlx::query("UPDATE users SET following_count = following_count + 1 WHERE id = $1")
+                .bind(follower_id)
+                .execute(&mut *tx)
+                .await;
 
-// Unfollow a user
-async fn unfollow_user(
-    data: web::Data<AppState>,
-    req: web::Json<FollowUserRequest>,
-) -> impl Responder {
-    let mut users = data.users.lock().unwrap();
-    let mut follows = data.follows.lock().unwrap();
+            let _ = sqlx::query("UPDATE users SET followers_count = followers_count + 1 WHERE id = $1")
+                .bind(following_id)
+                .execute(&mut *tx)
+                .await;
 
-    // Find and remove follow
-    if let Some(pos) = follows.iter().position(|f| f.follower_id == req.follower_id && f.following_id == req.following_id) {
-        follows.remove(pos);
+            let _ = tx.commit().await;
 
-        // Update follower/following counts
-        if let Some(follower) = users.iter_mut().find(|u| u.id == req.follower_id) {
-            follower.following_count = follower.following_count.saturating_sub(1);
+            HttpResponse::Ok().json(ApiResponse {
+                success: true,
+                data: Some("User followed successfully"),
+                message: None,
+            })
+        } else {
+            let _ = tx.rollback().await;
+            HttpResponse::BadRequest().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some("Already following this user".to_string()),
+            })
         }
-        if let Some(following) = users.iter_mut().find(|u| u.id == req.following_id) {
-            following.followers_count = following.followers_count.saturating_sub(1);
-        }
-
-        HttpResponse::Ok().json(ApiResponse {
-            success: true,
-            data: Some("User unfollowed successfully"),
-            message: None,
-        })
     } else {
-        HttpResponse::NotFound().json(ApiResponse::<()> {
+        let _ = tx.rollback().await;
+        HttpResponse::InternalServerError().json(ApiResponse::<()> {
             success: false,
             data: None,
-            message: Some("Follow relationship not found".to_string()),
+            message: Some("Failed to follow user".to_string()),
         })
     }
 }
 
-// Get followers of a user
-async fn get_followers(data: web::Data<AppState>, user_id: web::Path<String>) -> impl Responder {
-    let user_id = user_id.into_inner();
-    let follows = data.follows.lock().unwrap();
-    let followers: Vec<Follow> = follows
-        .iter()
-        .filter(|f| f.following_id == user_id)
-        .cloned()
-        .collect();
+async fn unfollow_user(state: web::Data<AppState>, req: HttpRequest, username: web::Path<String>) -> impl Responder {
+    let auth_header = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
     
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        data: Some(followers),
-        message: None,
-    })
+    let follower_id = match auth::get_user_id_from_token(auth_header, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(e),
+            });
+        }
+    };
+
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = $1")
+        .bind(username.as_str())
+        .fetch_optional(&state.db)
+        .await;
+
+    let following_id = match user {
+        Ok(Some(user)) => user.id,
+        Ok(None) => {
+            return HttpResponse::NotFound().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some("User not found".to_string()),
+            });
+        }
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(format!("Database error: {}", e)),
+            });
+        }
+    };
+
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(format!("Database error: {}", e)),
+            });
+        }
+    };
+
+    let delete_result = sqlx::query("DELETE FROM follows WHERE follower_id = $1 AND following_id = $2")
+        .bind(follower_id)
+        .bind(following_id)
+        .execute(&mut *tx)
+        .await;
+
+    match delete_result {
+        Ok(result) if result.rows_affected() > 0 => {
+            let _ = sqlx::query("UPDATE users SET following_count = following_count - 1 WHERE id = $1")
+                .bind(follower_id)
+                .execute(&mut *tx)
+                .await;
+
+            let _ = sqlx::query("UPDATE users SET followers_count = followers_count - 1 WHERE id = $1")
+                .bind(following_id)
+                .execute(&mut *tx)
+                .await;
+
+            let _ = tx.commit().await;
+
+            HttpResponse::Ok().json(ApiResponse {
+                success: true,
+                data: Some("User unfollowed successfully"),
+                message: None,
+            })
+        }
+        _ => {
+            let _ = tx.rollback().await;
+            HttpResponse::NotFound().json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some("Not following this user".to_string()),
+            })
+        }
+    }
 }
 
-// Get users that a user is following
-async fn get_following(data: web::Data<AppState>, user_id: web::Path<String>) -> impl Responder {
-    let user_id = user_id.into_inner();
-    let follows = data.follows.lock().unwrap();
-    let following: Vec<Follow> = follows
-        .iter()
-        .filter(|f| f.follower_id == user_id)
-        .cloned()
-        .collect();
-    
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        data: Some(following),
-        message: None,
-    })
-}
-
-// Get timeline (tweets from users you follow)
-async fn get_timeline(data: web::Data<AppState>, user_id: web::Path<String>) -> impl Responder {
-    let user_id = user_id.into_inner();
-    let follows = data.follows.lock().unwrap();
-    let tweets = data.tweets.lock().unwrap();
-    
-    // Get IDs of users being followed
-    let following_ids: Vec<String> = follows
-        .iter()
-        .filter(|f| f.follower_id == user_id)
-        .map(|f| f.following_id.clone())
-        .collect();
-    
-    // Get tweets from followed users
-    let mut timeline: Vec<Tweet> = tweets
-        .iter()
-        .filter(|t| following_ids.contains(&t.user_id))
-        .cloned()
-        .collect();
-    
-    // Sort by created_at descending (newest first)
-    timeline.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        data: Some(timeline),
-        message: None,
-    })
-}
-
-// ============ MAIN APPLICATION ============
+// ============ MAIN ============
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    dotenv().ok();
+    env_logger::init();
+
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let host = env::var("SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = env::var("SERVER_PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse()
+        .expect("SERVER_PORT must be a valid number");
+
+    // Create database pool
+    let pool = db::create_pool(&database_url)
+        .await
+        .expect("Failed to create database pool");
+
+    // Run migrations
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("Failed to run migrations");
+
     let app_state = web::Data::new(AppState {
-        users: Mutex::new(Vec::new()),
-        tweets: Mutex::new(Vec::new()),
-        likes: Mutex::new(Vec::new()),
-        follows: Mutex::new(Vec::new()),
+        db: pool,
+        jwt_secret,
     });
 
-    println!("🚀 Twitter API Server starting at http://127.0.0.1:3000");
-    println!("📋 Available endpoints:");
-    println!("   GET  /api/health            - Health check");
-    println!("   GET  /api/users             - Get all users");
-    println!("   GET  /api/users/{{id}}        - Get user by ID");
-    println!("   POST /api/users             - Create user");
-    println!("   GET  /api/tweets            - Get all tweets");
-    println!("   GET  /api/tweets/{{id}}       - Get tweet by ID");
-    println!("   GET  /api/users/{{id}}/tweets - Get user's tweets");
-    println!("   POST /api/tweets            - Create tweet");
-    println!("   DELETE /api/tweets/{{id}}     - Delete tweet");
-    println!("   POST /api/likes             - Like a tweet");
-    println!("   DELETE /api/likes           - Unlike a tweet");
-    println!("   GET  /api/tweets/{{id}}/likes - Get tweet's likes");
-    println!("   POST /api/follows           - Follow a user");
-    println!("   DELETE /api/follows         - Unfollow a user");
-    println!("   GET  /api/users/{{id}}/followers - Get user's followers");
-    println!("   GET  /api/users/{{id}}/following - Get users followed");
-    println!("   GET  /api/users/{{id}}/timeline  - Get user's timeline");
+    println!("🚀 Twitter API Server starting at http://{}:{}", host, port);
+    println!("📋 Database: Connected to PostgreSQL");
+    println!("🔐 Authentication: JWT enabled");
 
     HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header()
+            .max_age(3600);
+
         App::new()
+            .wrap(cors)
             .app_data(app_state.clone())
+            // Serve static frontend
+            .service(fs::Files::new("/", "./static").index_file("index.html"))
+            // API routes
             .route("/api/health", web::get().to(health_check))
+            // Auth routes
+            .route("/api/auth/register", web::post().to(register))
+            .route("/api/auth/login", web::post().to(login))
+            .route("/api/auth/me", web::get().to(get_me))
             // User routes
-            .route("/api/users", web::get().to(get_users))
-            .route("/api/users/{id}", web::get().to(get_user))
-            .route("/api/users", web::post().to(create_user))
+            .route("/api/users/{username}", web::get().to(get_user_by_username))
+            .route("/api/users/profile", web::put().to(update_profile))
             // Tweet routes
-            .route("/api/tweets", web::get().to(get_tweets))
-            .route("/api/tweets/{id}", web::get().to(get_tweet))
-            .route("/api/users/{id}/tweets", web::get().to(get_user_tweets))
             .route("/api/tweets", web::post().to(create_tweet))
+            .route("/api/tweets/timeline", web::get().to(get_timeline))
             .route("/api/tweets/{id}", web::delete().to(delete_tweet))
+            .route("/api/users/{username}/tweets", web::get().to(get_user_tweets))
             // Like routes
-            .route("/api/likes", web::post().to(like_tweet))
-            .route("/api/likes", web::delete().to(unlike_tweet))
-            .route("/api/tweets/{id}/likes", web::get().to(get_tweet_likes))
+            .route("/api/tweets/{id}/like", web::post().to(like_tweet))
+            .route("/api/tweets/{id}/unlike", web::delete().to(unlike_tweet))
             // Follow routes
-            .route("/api/follows", web::post().to(follow_user))
-            .route("/api/follows", web::delete().to(unfollow_user))
-            .route("/api/users/{id}/followers", web::get().to(get_followers))
-            .route("/api/users/{id}/following", web::get().to(get_following))
-            // Timeline route
-            .route("/api/users/{id}/timeline", web::get().to(get_timeline))
+            .route("/api/users/{username}/follow", web::post().to(follow_user))
+            .route("/api/users/{username}/unfollow", web::delete().to(unfollow_user))
     })
-    .bind(("127.0.0.1", 3000))?
+    .bind((host.as_str(), port))?
     .run()
     .await
 }
-

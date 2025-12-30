@@ -1,1 +1,36 @@
-/target
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment variables (NEVER commit real credentials)
+.env
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+
+# Log files
+*.log
+
+# Frontend build artifacts (if using React/Vue)
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Backup files
+*.bak
+*.backup
+
